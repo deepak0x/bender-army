@@ -1,0 +1,14 @@
+apiVersion: v2
+name: bender
+description: A Helm chart for Bender - Open-source framework connecting Slack to Claude Code in headless mode
+type: application
+version: 0.0.5
+appVersion: "0.0.5"
+maintainers:
+  - name: deepak0x
+    email: deepak0x@users.noreply.github.com
+keywords:
+  - slack
+  - claude-code
+  - ai-agent
+  - automation

@@ -1,0 +1,230 @@
+{{- if .Values.cronjob.enabled -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "bender.fullname" . }}-poll-script
+  labels:
+    {{- include "bender.labels" . | nindent 4 }}
+data:
+  poll.sh: |
+    #!/bin/sh
+    #
+    # Leantime polling script — detects new tasks assigned to Bender
+    # All configuration comes from environment variables (Vault secret)
+    #
+    set -eu
+
+    # Required env vars (from Vault):
+    #   LEANTIME_URL, LEANTIME_API_KEY, BENDER_API_KEY,
+    #   SLACK_BOT_TOKEN, SLACK_CHANNEL,
+    #   LEANTIME_PROJECT_ID, LEANTIME_STATUS_NEW, LEANTIME_EDITOR_ID
+    #
+    # Optional:
+    #   BENDER_API_URL (defaults to in-cluster service)
+
+    BENDER_API_URL="${BENDER_API_URL:-http://{{ include "bender.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local}"
+    PROJECT_ID="${LEANTIME_PROJECT_ID:-3}"
+    STATUS_NEW="${LEANTIME_STATUS_NEW:-3}"
+    EDITOR_ID="${LEANTIME_EDITOR_ID:-17}"
+    log()   { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*"; }
+    error() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] ERROR: $*" >&2; }
+
+    move_to_in_progress() {
+      task_json="$1"
+      task_id=$(echo "$task_json" | jq -r '.id')
+
+      # Build the update payload using jq to preserve all fields exactly
+      # (especially description which contains HTML with special characters)
+      payload=$(echo "$task_json" | jq -c '{
+        jsonrpc: "2.0",
+        method: "leantime.rpc.tickets.updateTicket",
+        params: {
+          values: {
+            id: .id,
+            projectId: .projectId,
+            headline: .headline,
+            description: (.description // ""),
+            status: "4",
+            priority: (.priority // "3"),
+            sprint: .sprint,
+            editorId: (.editorId // "17"),
+            tags: (.tags // ""),
+            milestoneid: (.milestoneid // 1080)
+          }
+        },
+        id: 1
+      }')
+
+      update_response=$(curl -s "${LEANTIME_URL}/api/jsonrpc" \
+        -H "x-api-key: ${LEANTIME_API_KEY}" \
+        -H "Content-Type: application/json" \
+        -d "$payload" 2>&1)
+
+      if printf '%s' "$update_response" | tr -d '\000-\011\013-\037' | jq -e '.result' > /dev/null 2>&1; then
+        log "Task $task_id moved to In Progress (status 4)"
+      else
+        error "Failed to move task $task_id to In Progress"
+        return 1
+      fi
+    }
+
+    notify_bender() {
+      task_id=$(echo "$1" | jq -r '.id')
+
+      http_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${BENDER_API_URL}/api/invoke" \
+        -H "Authorization: Bearer ${BENDER_API_KEY}" \
+        -H "Content-Type: application/json" \
+        -d "{
+          \"channel\": \"${SLACK_CHANNEL}\",
+          \"message\": \"New Leantime task assigned: ${LEANTIME_URL}/tickets/showKanban?search=true&projectId=${PROJECT_ID}&sprint=all#/tickets/showTicket/${task_id} — Read task details from Leantime API and follow the assigned tasks workflow.\"
+        }" 2>&1)
+
+      if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+        log "Bender notified for task $task_id (HTTP $http_code)"
+      else
+        error "Failed to notify Bender for task $task_id (HTTP $http_code)"
+        return 1
+      fi
+    }
+
+    notify_slack() {
+      message="$1"
+      if [ -z "${SLACK_BOT_TOKEN:-}" ]; then
+        error "SLACK_BOT_TOKEN not set"
+        return 1
+      fi
+      curl -s -X POST "https://slack.com/api/chat.postMessage" \
+        -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "{\"channel\":\"${SLACK_CHANNEL}\",\"text\":\"${message}\"}" > /dev/null 2>&1
+    }
+
+    validate_task() {
+      task_json="$1"
+      task_id=$(echo "$task_json" | jq -r '.id')
+      headline=$(echo "$task_json" | jq -r '.headline // empty')
+      description=$(echo "$task_json" | jq -r '.description // empty')
+      tags=$(echo "$task_json" | jq -r '.tags // empty')
+
+      errors=""
+
+      if [ -z "$headline" ]; then
+        errors="${errors}  - missing headline\n"
+      fi
+
+      if [ -z "$description" ]; then
+        errors="${errors}  - missing description\n"
+      fi
+
+      if [ -z "$tags" ]; then
+        errors="${errors}  - no tag (exactly 1 required)\n"
+      else
+        tag_count=$(echo "$tags" | tr ',' '\n' | wc -l | tr -d ' ')
+        if [ "$tag_count" -gt 1 ]; then
+          errors="${errors}  - multiple tags: '${tags}' (exactly 1 required)\n"
+        fi
+      fi
+
+      if [ -n "$errors" ]; then
+        error_msg="Task ID $task_id has validation issues:\n${errors}\nPlease correct before processing.\nLink: ${LEANTIME_URL}/tickets/showKanban#/tickets/showTicket/$task_id"
+        log "Task $task_id failed validation"
+        notify_slack "$error_msg"
+        return 1
+      fi
+      return 0
+    }
+
+    # === MAIN ===
+    log "=== Leantime polling start ==="
+
+    if [ -z "${LEANTIME_API_KEY:-}" ]; then
+      error "LEANTIME_API_KEY not set"
+      exit 1
+    fi
+
+    response=$(curl -s "${LEANTIME_URL}/api/jsonrpc" \
+      -H "x-api-key: ${LEANTIME_API_KEY}" \
+      -H "Content-Type: application/json" \
+      -d "{
+        \"jsonrpc\": \"2.0\",
+        \"method\": \"leantime.rpc.tickets.getAll\",
+        \"params\": {},
+        \"id\": 1
+      }" 2>&1)
+
+    # Check for API errors before parsing
+    api_error=$(printf '%s' "$response" | tr -d '\000-\011\013-\037' | jq -r '.error // empty' 2>/dev/null || echo "")
+    if [ -n "$api_error" ]; then
+      error "Leantime API error: $api_error"
+      exit 1
+    fi
+
+    # Sanitize response: Leantime returns invalid control characters in JSON
+    # that cause jq to fail. Strip C0 control chars (except newline \012) before parsing.
+    tasks=$(printf '%s' "$response" | tr -d '\000-\011\013-\037' | jq -c ".result[] | select(.projectId == $PROJECT_ID and .status == $STATUS_NEW and .editorId == \"$EDITOR_ID\")" 2>/dev/null || echo "")
+
+    if [ -z "$tasks" ]; then
+      log "No new tasks assigned."
+    else
+      task_count=0
+      echo "$tasks" | while IFS= read -r task; do
+        if [ -n "$task" ]; then
+          task_id=$(echo "$task" | jq -r '.id')
+          log "Processing task $task_id..."
+          if validate_task "$task"; then
+            if move_to_in_progress "$task"; then
+              notify_bender "$task"
+            fi
+          fi
+          task_count=$((task_count + 1))
+        fi
+      done
+      log "Processing complete."
+    fi
+
+    log "=== Leantime polling end ==="
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "bender.fullname" . }}-poll
+  labels:
+    {{- include "bender.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.cronjob.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: {{ .Values.cronjob.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.cronjob.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ .Values.cronjob.backoffLimit }}
+      template:
+        metadata:
+          labels:
+            {{- include "bender.selectorLabels" . | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: poll
+              image: alpine:3.21
+              command: ["/bin/sh", "-c", "apk add --no-cache curl jq >/dev/null 2>&1 && sh /scripts/poll.sh"]
+              envFrom:
+                - secretRef:
+                    name: {{ .Values.vault.secrets.env.destinationSecretName }}
+              volumeMounts:
+                - name: script
+                  mountPath: /scripts
+                  readOnly: true
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 32Mi
+                limits:
+                  cpu: 100m
+                  memory: 64Mi
+          volumes:
+            - name: script
+              configMap:
+                name: {{ include "bender.fullname" . }}-poll-script
+                defaultMode: 0755
+{{- end }}

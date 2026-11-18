@@ -1,0 +1,126 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "bender.fullname" . }}
+  labels:
+    {{- include "bender.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "bender.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "bender.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- if and .Values.imageCredentials.registry .Values.imageCredentials.username .Values.imageCredentials.password }}
+      imagePullSecrets:
+        - name: {{ include "bender.fullname" . }}-registry
+      {{- end }}
+      serviceAccountName: {{ include "bender.serviceAccountName" . }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.workspace.git.enabled }}
+      initContainers:
+        - name: clone-workspace
+          image: alpine/git:latest
+          env:
+            - name: GIT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.vault.secrets.env.destinationSecretName }}
+                  key: {{ .Values.workspace.git.tokenField }}
+          command:
+            - sh
+            - -c
+            - |
+              REPO_URL=$(echo "{{ .Values.workspace.git.repository }}" | sed "s|https://|https://{{ .Values.workspace.git.tokenUser }}:${GIT_TOKEN}@|")
+              git clone --single-branch --branch {{ .Values.workspace.git.branch }} "${REPO_URL}" /workspace
+              # Configure SSH for GitHub access using key from workspace
+              if [ -f /workspace/.ssh/id_ed25519 ]; then
+                cp /workspace/.ssh/id_ed25519 /ssh-config/id_ed25519
+                chmod 600 /ssh-config/id_ed25519
+                ssh-keyscan -t ed25519 github.com >> /ssh-config/known_hosts 2>/dev/null
+              fi
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: ssh-config
+              mountPath: /ssh-config
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          envFrom:
+            - secretRef:
+                name: {{ .Values.vault.secrets.env.destinationSecretName }}
+          {{- if .Values.env }}
+          env:
+            {{- range $key, $value := .Values.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: workspace
+              mountPath: {{ .Values.workspace.mountPath }}
+            {{- if .Values.persistence.enabled }}
+            - name: claude-data
+              mountPath: {{ .Values.persistence.mountPath }}
+            {{- end }}
+            - name: ssh-config
+              mountPath: /root/.ssh
+      volumes:
+        - name: workspace
+          emptyDir: {}
+        - name: ssh-config
+          emptyDir: {}
+        {{- if .Values.persistence.enabled }}
+        - name: claude-data
+          persistentVolumeClaim:
+            claimName: {{ include "bender.fullname" . }}-claude-data
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
